@@ -1,0 +1,174 @@
+name: Executorch Backend Monitor
+
+on:
+  schedule:
+    - cron: '0 0 * * *' 
+  workflow_dispatch:      
+
+jobs:
+  sync-and-filter:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout Your Repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.BACKEND_MONITOR_PAT }}
+
+      - name: Check Upstream and Filter
+        id: check
+        run: |
+          UPSTREAM_SHA=$(curl -s -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+            "https://api.github.com/repos/pytorch/executorch/branches/viable/strict" | jq -r .commit.sha)
+          
+          LAST_SHA=$(cat LAST_SHA.txt 2>/dev/null || echo "")
+          
+          echo "upstream_sha=$UPSTREAM_SHA" >> $GITHUB_OUTPUT
+          echo "last_sha=$LAST_SHA" >> $GITHUB_OUTPUT
+
+          if [ "$UPSTREAM_SHA" == "$LAST_SHA" ]; then
+            echo "has_changes=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          if [ -z "$LAST_SHA" ]; then
+            echo "has_changes=true" >> $GITHUB_OUTPUT
+          else
+            git remote add upstream https://github.com/pytorch/executorch.git || true
+            git fetch upstream viable/strict --quiet
+            DIFF=$(git diff --name-only $LAST_SHA $UPSTREAM_SHA -- backends/qualcomm backends/mediatek native_functions.yaml)
+            
+            if [ -n "$DIFF" ]; then
+              echo "has_changes=true" >> $GITHUB_OUTPUT
+            else
+              echo "has_changes=false" >> $GITHUB_OUTPUT
+              echo "$UPSTREAM_SHA" > LAST_SHA.txt
+              git config user.name "github-actions"
+              git config user.email "actions@github.com"
+              git add LAST_SHA.txt
+              git commit -m "chore: update tracked sha to $UPSTREAM_SHA"
+              git push origin main
+            fi
+          fi
+
+      - name: Sync and AI Summary
+        if: steps.check.outputs.has_changes == 'true'
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          # 1. Git 环境准备
+          git config user.name "github-actions"
+          git config user.email "actions@github.com"
+          
+          # 检查 upstream 是否存在，不存在则添加，存在则更新
+          git remote add upstream https://github.com/pytorch/executorch.git || git remote set-url upstream https://github.com/pytorch/executorch.git
+          
+          # 2. 备份当前 Workflows
+          mkdir -p ../backup_workflows
+          cp .github/workflows/*.yml ../backup_workflows/
+          [ -f "LAST_SHA.txt" ] && cp LAST_SHA.txt ../backup_workflows/
+
+          # 3. 获取 Diff 内容 (扩大到 100k 字符以支持长周期演进)
+          git fetch upstream viable/strict
+          DIFF_CONTENT=$(git diff ${{ steps.check.outputs.last_sha }} ${{ steps.check.outputs.upstream_sha }} -- backends/qualcomm backends/mediatek native_functions.yaml | head -c 100000)
+
+          # 4. 使用 Heredoc 写入 Python 脚本 (彻底解决缩进问题)
+          cat << 'EOF' > openai_analyze.py
+          import os
+          import requests
+          import json
+          import sys
+          
+          api_key = os.getenv("OPENAI_API_KEY")
+          diff_text = os.getenv("DIFF_DATA")
+          last_sha = os.getenv("LAST_SHA")
+          curr_sha = os.getenv("CURR_SHA")
+          
+          if not api_key:
+              with open("ai_summary.txt", "w") as f:
+                  f.write("Skipping AI Summary: Missing Key.")
+              sys.exit(0)
+
+          if not diff_text:
+              with open("ai_summary.txt", "w") as f:
+                  f.write("Skipping AI Summary: Missing Diff.")
+              sys.exit(0)
+          
+          url = "https://api.openai.com/v1/responses"
+          
+          prompt = f"""
+          你是一个资深 AI 编译器工程师。
+          
+          请分析 ExecuTorch 从 commit {last_sha} 到 {curr_sha} 的代码变化。
+          
+          重点关注：
+          - Qualcomm QNN backend
+          - MediaTek backend
+          - native_functions.yaml
+          
+          输出要求：
+          1. 技术演进总结
+          2. 新增算子
+          3. API变化
+          4. 架构重构点
+          5. 对端侧部署的影响
+          
+          代码 diff：
+          {diff_text}
+          """
+          
+          payload = {
+              "model": "gpt-4.1-mini",
+              "input": prompt,
+              "max_output_tokens": 1200
+          }
+          
+          headers = {
+              "Authorization": f"Bearer {api_key}",
+              "Content-Type": "application/json"
+          }
+          
+          try:
+              resp = requests.post(url, headers=headers, json=payload, timeout=120)
+              resp.raise_for_status()
+          
+              result = resp.json()
+              text = result["output"][0]["content"][0]["text"]
+          
+              with open("ai_summary.txt", "w", encoding="utf-8") as f:
+                  f.write(text)
+          
+          except Exception as e:
+              with open("ai_summary.txt", "w", encoding="utf-8") as f:
+                  f.write("AI Analysis failed: " + str(e))
+          EOF
+
+          # 5. 执行 Python 脚本
+          export DIFF_DATA="$DIFF_CONTENT"
+          export LAST_SHA="${{ steps.check.outputs.last_sha }}"
+          export CURR_SHA="${{ steps.check.outputs.upstream_sha }}"
+          python3 openai_analyze.py
+
+          # 6. 生成 GitHub Summary
+          echo "### 🚀 ExecuTorch Sync & AI Evolution Report" >> $GITHUB_STEP_SUMMARY
+          echo "**Time Period:** \`${{ steps.check.outputs.last_sha }}\` ➡️ \`${{ steps.check.outputs.upstream_sha }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "#### ✨ OpenAI 技术演进总结" >> $GITHUB_STEP_SUMMARY
+          cat ai_summary.txt >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "#### 📂 变更统计" >> $GITHUB_STEP_SUMMARY
+          echo '```text' >> $GITHUB_STEP_SUMMARY
+          git diff --stat ${{ steps.check.outputs.last_sha }} ${{ steps.check.outputs.upstream_sha }} -- backends/qualcomm backends/mediatek native_functions.yaml >> $GITHUB_STEP_SUMMARY || true
+          echo '```' >> $GITHUB_STEP_SUMMARY
+
+          # 7. 重置项目并强制推送
+          git reset --hard upstream/viable/strict
+          rm -rf .github/workflows/*
+          cp ../backup_workflows/*.yml .github/workflows/
+          echo "${{ steps.check.outputs.upstream_sha }}" > LAST_SHA.txt
+          git add .
+          git commit -m "sync: update to $UPSTREAM_SHA with AI analysis"
+          git push origin main --force
